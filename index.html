@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Machinery Image Processor</title>
+<link rel="stylesheet" href="css/style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <h1>Machinery Image Processor</h1>
+    <div class="topbar-actions">
+      <button id="loadPhotoBtn" class="btn">Load Photo</button>
+      <button id="newSessionBtn" class="btn">New Session</button>
+      <button id="historyBtn" class="btn">History</button>
+    </div>
+  </header>
+
+  <main class="layout">
+    <section class="canvas-wrap">
+      <div class="views-bar">
+        <div class="views-tabs" id="viewsTabs"></div>
+        <button id="addViewBtn" class="btn">+ Add View</button>
+      </div>
+      <div class="canvas-toolbar">
+        <div class="mode-group">
+          <button class="mode-btn" data-mode="pan" title="Pan / select">Pan</button>
+          <button class="mode-btn" data-mode="scale" title="Click 2 points to set the reference scale">Set Scale</button>
+          <button class="mode-btn" data-mode="group" title="Add points to the active group">Add Points</button>
+          <button class="mode-btn" data-mode="quick" title="Click 2 points for a one-off measurement">Quick Measure</button>
+          <button class="mode-btn" data-mode="depth" title="Mark where a tool from another view sits on the depth axis">Mark Depth</button>
+        </div>
+        <div class="zoom-group">
+          <button id="zoomOutBtn" class="btn">−</button>
+          <button id="fitBtn" class="btn">Fit</button>
+          <button id="zoomInBtn" class="btn">+</button>
+        </div>
+      </div>
+      <div class="canvas-holder">
+        <canvas id="mainCanvas"></canvas>
+        <div id="emptyState" class="empty-state">Load a photo to begin</div>
+        <div id="linkingBanner" class="linking-banner hidden">
+          <span id="linkingBannerText"></span>
+          <button id="linkingSkipBtn" class="btn">Skip (not visible)</button>
+          <button id="linkingStopBtn" class="btn">Done</button>
+        </div>
+      </div>
+    </section>
+
+    <aside class="sidebar">
+      <div class="panel" id="sessionPanel">
+        <h2>Tool Profile</h2>
+        <input type="text" id="sessionName" placeholder="Machine / tool name" />
+        <textarea id="sessionNotes" placeholder="Notes (machine type, brand, date...)"></textarea>
+        <div class="row">
+          <label>Display unit
+            <select id="displayUnit">
+              <option value="mm">mm</option>
+              <option value="cm" selected>cm</option>
+              <option value="in">in</option>
+              <option value="ft">ft</option>
+            </select>
+          </label>
+        </div>
+        <div class="btn-row">
+          <button id="saveBtn" class="btn primary">Save</button>
+          <button id="exportJsonBtn" class="btn">Export JSON</button>
+          <button id="exportCsvBtn" class="btn">Export CSV</button>
+          <button id="exportPngBtn" class="btn">Export PNG</button>
+        </div>
+        <button id="renderBtn" class="btn primary" style="margin-top:8px; width:100%;">Render Implement</button>
+      </div>
+
+      <div class="panel" id="scalePanel">
+        <h2>Reference Scale (this view)</h2>
+        <p class="hint">Each view has its own scale. Click "Set Scale" above, then click both ends of a known-width object in this photo.</p>
+        <div class="row">
+          <span id="scaleStatus">Not set</span>
+        </div>
+        <select id="scaleRefSource">
+          <option value="">— or use a measurement from another view —</option>
+        </select>
+        <div class="row">
+          <input type="number" id="knownDistanceValue" placeholder="Known distance" step="any" min="0" />
+          <select id="knownDistanceUnit">
+            <option value="mm">mm</option>
+            <option value="cm" selected>cm</option>
+            <option value="in">in</option>
+            <option value="ft">ft</option>
+          </select>
+          <button id="applyScaleBtn" class="btn">Apply</button>
+        </div>
+        <button id="resetScaleBtn" class="btn subtle">Reset scale points</button>
+      </div>
+
+      <div class="panel" id="groupsPanel">
+        <h2>Tools in this View</h2>
+        <p class="hint">Add one entry per tool component visible in this photo (e.g. "Fluted Coulter", "Subsoiler Shank"). Click each repeated instance for count/spacing/width, then optionally set its size.</p>
+        <button id="addToolBtn" class="btn primary">+ Add Tool</button>
+        <div id="groupsList"></div>
+      </div>
+
+      <div class="panel" id="depthPanel">
+        <h2>Link Points From Other Views</h2>
+        <p class="hint" id="depthPanelHint"></p>
+        <div id="topAxisControl"></div>
+        <div id="depthAnchorList"></div>
+      </div>
+
+      <div class="panel" id="summaryPanel">
+        <h2>Implement Summary — All Views</h2>
+        <p class="hint">Combines matching tools measured across Front/Profile/Back etc. into one profile.</p>
+        <div id="summaryList"></div>
+      </div>
+
+      <div class="panel" id="quickPanel">
+        <h2>Quick Measurements (this view)</h2>
+        <div id="quickList"></div>
+      </div>
+    </aside>
+  </main>
+
+  <div id="viewSetupModal" class="modal hidden">
+    <div class="modal-box">
+      <div class="modal-header">
+        <h2 id="viewSetupTitle">Add View</h2>
+        <button id="closeViewSetupBtn" class="btn">Close</button>
+      </div>
+      <label>Role (what this photo shows)
+        <select id="viewRoleSelect">
+          <option value="back">Back</option>
+          <option value="side">Side</option>
+          <option value="front">Front</option>
+          <option value="top">Top</option>
+          <option value="other">Other</option>
+        </select>
+      </label>
+      <p class="hint">Front/Back/Top: this photo's horizontal axis is left-right. Side: its horizontal axis is front-to-back (depth) — used to place tools in 3D.</p>
+      <input type="text" id="viewLabelInput" placeholder="Label" />
+      <label class="btn" style="display:block; text-align:center; margin-top:8px;">
+        Choose Photo
+        <input type="file" id="viewSetupFileInput" accept="image/*" hidden />
+      </label>
+    </div>
+  </div>
+
+  <div id="toolPickerModal" class="modal hidden">
+    <div class="modal-box">
+      <div class="modal-header">
+        <h2>Add a Tool</h2>
+        <button id="closeToolPickerBtn" class="btn">Close</button>
+      </div>
+      <div id="toolPickerBody"></div>
+    </div>
+  </div>
+
+  <div id="renderModal" class="modal hidden">
+    <div class="modal-box modal-box-wide">
+      <div class="modal-header">
+        <h2>Implement Render</h2>
+        <div class="btn-row">
+          <button class="btn render-tab-btn active" data-render-tab="scatter">3D Scatter</button>
+          <button class="btn render-tab-btn" data-render-tab="schematic">Schematic</button>
+          <button id="downloadRenderSvgBtn" class="btn">Download SVG</button>
+          <button id="downloadRenderPngBtn" class="btn">Download PNG</button>
+          <button id="closeRenderBtn" class="btn">Close</button>
+        </div>
+      </div>
+
+      <div id="scatterTab">
+        <p class="hint">Color-coded tools in 3D: X = left-right, Z = front-to-back (from Depth Positions marked in a side/top view), Y = each tool's measured diameter/length/width, drawn as a stem down from the toolbar. A tool with no size set yet (no "Set diameter/length/width") shows as a flat dot. Drag to rotate.</p>
+        <p id="scatterScaleWarning" class="hint depth-scale-warning hidden"></p>
+        <div class="scatter-toolbar">
+          <button id="scatterRotateLeftBtn" class="btn">⟲ Rotate</button>
+          <button id="scatterRotateRightBtn" class="btn">Rotate ⟳</button>
+          <button id="scatterResetBtn" class="btn">Reset view</button>
+        </div>
+        <div class="scatter-holder">
+          <canvas id="scatterCanvas"></canvas>
+        </div>
+        <div id="scatterLegend" class="scatter-legend"></div>
+      </div>
+
+      <div id="schematicTab" class="hidden">
+        <p class="hint">Each lane is one tool, laid out at its measured real-world offset from the implement's centerline. Lanes from different views are aligned on that shared centerline — treat cross-view alignment as approximate.</p>
+        <div id="renderSvgHolder" class="render-svg-holder"></div>
+        <div id="renderUnplaced"></div>
+      </div>
+    </div>
+  </div>
+
+  <div id="historyModal" class="modal hidden">
+    <div class="modal-box">
+      <div class="modal-header">
+        <h2>Saved Sessions</h2>
+        <button id="closeHistoryBtn" class="btn">Close</button>
+      </div>
+      <div id="historyList"></div>
+    </div>
+  </div>
+
+  <script type="module" src="js/app.js"></script>
+</body>
+</html>
