@@ -26,6 +26,7 @@
         <div class="mode-group">
           <button class="mode-btn" data-mode="pan" title="Pan / select">Pan</button>
           <button class="mode-btn" data-mode="scale" title="Click 2 points to set the reference scale">Set Scale</button>
+          <button class="mode-btn" data-mode="centerline" title="Click the hitch, then the farthest-back point along the implement's centerline">Set Direction</button>
           <button class="mode-btn" data-mode="group" title="Add points to the active group">Add Points</button>
           <button class="mode-btn" data-mode="quick" title="Click 2 points for a one-off measurement">Quick Measure</button>
           <button class="mode-btn" data-mode="depth" title="Mark where a tool from another view sits on the depth axis">Mark Depth</button>
@@ -91,6 +92,15 @@
           <button id="applyScaleBtn" class="btn">Apply</button>
         </div>
         <button id="resetScaleBtn" class="btn subtle">Reset scale points</button>
+      </div>
+
+      <div class="panel" id="directionPanel">
+        <h2>Implement Direction (this view)</h2>
+        <p class="hint">Click "Set Direction" above, then click the hitch (tractor connection — always the front), then the farthest-back point along the implement's own centerline. This fixes a Top view's orientation without guessing, and corrects every measurement in this view for the camera/implement not being held perfectly level — it does not correct true camera-angle perspective (shooting from up/down at the implement).</p>
+        <div class="row">
+          <span id="directionStatus">Not set</span>
+        </div>
+        <button id="clearDirectionBtn" class="btn subtle hidden">Clear direction</button>
       </div>
 
       <div class="panel" id="groupsPanel">
@@ -161,6 +171,7 @@
         <div class="btn-row">
           <button class="btn render-tab-btn active" data-render-tab="scatter">3D Scatter</button>
           <button class="btn render-tab-btn" data-render-tab="schematic">Schematic</button>
+          <button class="btn render-tab-btn" data-render-tab="profile">Profile</button>
           <button id="downloadRenderSvgBtn" class="btn">Download SVG</button>
           <button id="downloadRenderPngBtn" class="btn">Download PNG</button>
           <button id="closeRenderBtn" class="btn">Close</button>
@@ -185,6 +196,47 @@
         <p class="hint">Each lane is one tool, laid out at its measured real-world offset from the implement's centerline. Lanes from different views are aligned on that shared centerline — treat cross-view alignment as approximate.</p>
         <div id="renderSvgHolder" class="render-svg-holder"></div>
         <div id="renderUnplaced"></div>
+      </div>
+
+      <div id="profileTab" class="hidden">
+        <p class="hint">A preview of the soil cross-section as it will look in the OFE Cross-Section Tool — depth is measured below that view's Gauge/Leveling Wheel, if one was measured in the same photo, otherwise it's only relative to that view's own shallowest tool. The deepest tool (★, solid outline) becomes the tillage pass exported below. The depth of each tool RELATIVE to the others is fixed, measured geometry — not editable here; use "Overall implement depth" below to adjust the whole implement at once. Tillage Type and Soil Inversion default from the tool catalog — edit either in the table to correct them; edits are saved with this profile.</p>
+        <p id="profileNoDataHint" class="hint hidden">No tool has a "lowest point" set yet — switch to a Side view, then open a tool's card (or the Link Points From Other Views panel) and click "Set lowest point." That button only appears while viewing a Side view.</p>
+        <p id="profileUnscaledHint" class="hint depth-scale-warning hidden"></p>
+        <p id="profileDominantCrossViewHint" class="hint depth-scale-warning hidden"></p>
+        <div class="implement-depth-row">
+          <label>Profile unit
+            <select id="profileUnitSelect">
+              <option value="mm">mm</option>
+              <option value="cm">cm</option>
+              <option value="in">in</option>
+              <option value="ft">ft</option>
+            </select>
+          </label>
+          <span class="measured-note">Independent of the session's photo-measurement unit above — change freely.</span>
+        </div>
+        <div id="implementDepthRow" class="implement-depth-row hidden">
+          <label>Overall implement depth (deepest tool)
+            <input type="number" id="implementDepthInput" step="any" />
+          </label>
+          <span id="implementDepthUnit"></span>
+          <button id="applyImplementDepthBtn" class="btn">Apply</button>
+          <button id="resetImplementDepthBtn" class="btn hidden">Reset to measured</button>
+          <span id="implementDepthMeasuredNote" class="measured-note"></span>
+        </div>
+        <div id="bedWidthRow" class="implement-depth-row hidden">
+          <label>Bed width
+            <input type="number" id="bedWidthInput" step="any" />
+          </label>
+          <span id="bedWidthUnit"></span>
+          <button id="applyBedWidthBtn" class="btn">Apply</button>
+          <button id="resetBedWidthBtn" class="btn hidden">Reset to measured</button>
+          <span id="bedWidthMeasuredNote" class="measured-note"></span>
+        </div>
+        <div id="profileCrossSectionHolder" class="render-svg-holder"></div>
+        <div id="profileTableHolder"></div>
+        <div class="btn-row" style="margin-top:10px;">
+          <button id="exportTillageJsonBtn" class="btn primary">Export Tillage Pass JSON</button>
+        </div>
       </div>
     </div>
   </div>

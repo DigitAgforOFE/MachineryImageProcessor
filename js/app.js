@@ -13,10 +13,11 @@ import {
   characteristicResult,
   seriesPoints,
   lateralCoordOf,
+  round,
 } from "./measurements.js";
-import { exportSessionJSON, exportSessionCSV, exportAnnotatedPNG } from "./export.js";
-import { TOOL_TYPES, TOOL_CATEGORIES, getToolType, preferredAxisFor } from "./toolCatalog.js";
-import { buildImplementRender, buildScatterPoints, findUnscaledDepthViews, downloadSvg, downloadSvgAsPng } from "./render.js";
+import { exportSessionJSON, exportSessionCSV, exportAnnotatedPNG, download } from "./export.js";
+import { TOOL_TYPES, TOOL_CATEGORIES, TILLAGE_TYPES, getToolType, preferredAxisFor } from "./toolCatalog.js";
+import { buildImplementRender, buildScatterPoints, buildToolDepthProfile, buildTillageCrossSectionSvg, findUnscaledDepthViews, findUnscaledLowestPointViews, downloadSvg, downloadSvgAsPng } from "./render.js";
 import { Scatter3D } from "./scatter3d.js";
 
 // Chosen for maximum hue separation at a glance on the dark background — adjacent
@@ -52,13 +53,14 @@ function newView(label, role) {
     id: uid(),
     label,
     role, // 'front' | 'back' | 'side' | 'top' | 'other' — decides which axis this view's positions represent
-    topLateralAxis: "y", // 'top' only: which pixel axis is left-right in this photo — 'y' if the implement's length runs across the frame, 'x' if it runs down it
+    topLateralAxis: "y", // 'top' only: which pixel axis is left-right in this photo — 'y' if the implement's length runs across the frame, 'x' if it runs down it — superseded by `centerline` below when one is set
+    centerline: null, // {hitch:{x,y}, rear:{x,y}} — hitch (tractor connection) + the implement's farthest-back point along its own centerline, in THIS photo. Gives the true fore-aft direction and corrects for the camera/implement not being held level — see localAxesOf in measurements.js
     imageBlob: null,
     imageWidth: 0,
     imageHeight: 0,
     thumbnail: null,
     scale: { p1: null, p2: null, knownDistanceValue: null, knownDistanceUnit: "cm", pixelsPerMm: null },
-    groups: [], // {id, toolTypeId, name, color, positions: [{x,y}], characteristic: {p1,p2}|null}
+    groups: [], // {id, toolTypeId, name, color, positions: [{x,y}], characteristic: {p1,p2}|null, depthPoint: {x,y,viewId}|null, profileOverride: {tillageType?,soilInversion?,fullWidth?}|null}
     depthAnchors: [], // {id, kind:'instance'|'reference', viewId, groupId?, positionIndex?, x, y} — this view's depth (Z) position for a point or scale reference defined in another view
     equalSpacingGroups: {}, // { [groupId]: linkId } — groups native to this view sharing a linkId are pooled and snapped to one perfectly uniform sequence
     quickMeasurements: [],
@@ -86,6 +88,23 @@ function newSessionState() {
     activeViewId: null,
     createdAt: Date.now(),
     updatedAt: Date.now(),
+    // The implement's real operating depth (its deepest/dominant tool), overriding the
+    // photo-measured value — the photo is usually taken with the implement parked/
+    // raised, not actually in the ground, so its absolute depth means nothing, but the
+    // RELATIVE depth between tools (which one runs deeper than another) is still real
+    // geometry read off the photo. Setting this shifts every tool's depth by the same
+    // amount, preserving that relative structure — see buildToolDepthProfile.
+    profileDepthOverride: null,
+    // Profile tab's own display unit (mm/cm/in/ft) — independent of `displayUnit`
+    // above, since the OFE Cross-Section Tool's own convention (inches) may not match
+    // whatever unit is convenient for photo measurements elsewhere. Falls back to
+    // `displayUnit` when unset.
+    profileUnit: null,
+    // The bed's real overall width, overriding the photo-measured estimate — the OFE
+    // tool's own "Bed width" field is a plain typed number too (e.g. "90 in"), not
+    // derived from anything, so this matches that rather than trusting a noisy
+    // estimate from whatever happened to be visible/measured in the photo.
+    profileBedWidthOverride: null,
   };
 }
 
@@ -99,6 +118,8 @@ const state = {
   characteristicPending: null, // first click of that pair
   depthAnchorTarget: null, // {kind:'instance'|'reference', viewId, groupId?, positionIndex?} currently being linked on this (side/top) view
   spanPending: null, // first click of a "span" tool's current left/right edge pair
+  depthPointTarget: null, // group id currently capturing its single "lowest point" click
+  centerlinePending: null, // first click (hitch) of the active view's direction reference pair
 };
 
 function activeView() {
@@ -278,6 +299,8 @@ function resetInteractionState() {
   state.characteristicPending = null;
   state.depthAnchorTarget = null;
   state.spanPending = null;
+  state.depthPointTarget = null;
+  state.centerlinePending = null;
 }
 
 document.getElementById("newSessionBtn").addEventListener("click", () => {
@@ -337,6 +360,18 @@ function handleCanvasClick(imgPt) {
     }
     refreshSidebar();
     refreshOverlay();
+  } else if (state.mode === "centerline") {
+    if (!state.centerlinePending) {
+      state.centerlinePending = imgPt;
+      refreshSidebar();
+      refreshOverlay();
+    } else {
+      v.centerline = { hitch: state.centerlinePending, rear: imgPt };
+      state.centerlinePending = null;
+      setMode("pan");
+      refreshSidebar();
+      refreshOverlay();
+    }
   } else if (state.mode === "group") {
     const group = v.groups.find((g) => g.id === state.activeGroupId);
     if (!group) {
@@ -359,9 +394,20 @@ function handleCanvasClick(imgPt) {
   } else if (state.mode === "characteristic") {
     // The target group may live in a DIFFERENT view than the one active right now —
     // e.g. a disk created in Back, but its diameter set from Side where it's visible
-    // face-on — so search every view, not just this one.
+    // face-on — so search every view, not just this one. Diameter/length are hard-
+    // blocked outside a Side view (see renderGroups) — checked here too in case
+    // mode/target state goes stale. Width stays allowed from any view.
     const group = findGroupById(state.characteristicTarget);
     if (!group) return;
+    const groupTool = getToolType(group.toolTypeId);
+    if (groupTool && preferredAxisFor(groupTool.dimension) === "depth" && v.role !== "side") {
+      alert(`${groupTool.dimension[0].toUpperCase()}${groupTool.dimension.slice(1)} can only be set from a Side view.`);
+      state.characteristicPending = null;
+      state.characteristicTarget = null;
+      setMode("pan");
+      refreshSidebar();
+      return;
+    }
     if (!state.characteristicPending) {
       state.characteristicPending = imgPt;
       refreshOverlay();
@@ -373,6 +419,24 @@ function handleCanvasClick(imgPt) {
       refreshSidebar();
       refreshOverlay();
     }
+  } else if (state.mode === "depthpoint") {
+    // Unlike characteristic, lowest point is only meaningful from a Side view (it's a
+    // vertical/photo-Y measurement a Front/Back/Top photo can't show) — hard-blocked
+    // here too, not just by hiding the button, in case mode/target state goes stale.
+    if (v.role !== "side") {
+      alert("A tool's lowest point can only be set from a Side view.");
+      state.depthPointTarget = null;
+      setMode("pan");
+      refreshSidebar();
+      return;
+    }
+    const group = findGroupById(state.depthPointTarget);
+    if (!group) return;
+    group.depthPoint = { x: imgPt.x, y: imgPt.y, viewId: v.id };
+    state.depthPointTarget = null;
+    setMode("pan");
+    refreshSidebar();
+    refreshOverlay();
   } else if (state.mode === "quick") {
     if (!state.quickPending) {
       state.quickPending = imgPt;
@@ -482,12 +546,20 @@ function handleMarkerDrag(ref, imgPt) {
   clampToImage(imgPt);
   if (ref.kind === "scale") {
     v.scale[ref.which] = imgPt;
+  } else if (ref.kind === "centerline") {
+    if (v.centerline) v.centerline[ref.which] = imgPt;
   } else if (ref.kind === "group") {
     const group = v.groups.find((g) => g.id === ref.groupId);
     if (group) group.positions[ref.index] = imgPt;
   } else if (ref.kind === "characteristic") {
     const group = findGroupById(ref.groupId);
     if (group && group.characteristic) group.characteristic[ref.which] = imgPt;
+  } else if (ref.kind === "depthpoint") {
+    const group = findGroupById(ref.groupId);
+    if (group && group.depthPoint) {
+      group.depthPoint.x = imgPt.x;
+      group.depthPoint.y = imgPt.y;
+    }
   } else if (ref.kind === "quick") {
     const qm = v.quickMeasurements.find((q) => q.id === ref.id);
     if (qm) qm[ref.which] = imgPt;
@@ -531,8 +603,24 @@ document.getElementById("resetScaleBtn").addEventListener("click", () => {
   refreshOverlay();
 });
 
+document.getElementById("clearDirectionBtn").addEventListener("click", () => {
+  const v = activeView();
+  if (!v) return;
+  v.centerline = null;
+  refreshSidebar();
+  refreshOverlay();
+});
+
 document.getElementById("displayUnit").addEventListener("change", (e) => {
   state.session.displayUnit = e.target.value;
+  // profileUnit silently inherits displayUnit while unset — if so, changing
+  // displayUnit also changes what unit the Profile tab's overrides get interpreted
+  // in, so they need clearing the same way changing the Profile tab's own unit
+  // selector already does (see profileUnitSelect's handler below).
+  if (state.session.profileUnit == null) {
+    state.session.profileDepthOverride = null;
+    state.session.profileBedWidthOverride = null;
+  }
   refreshSidebar();
 });
 
@@ -621,6 +709,8 @@ function addGroup(tool) {
     color: colorForNewGroup(tool),
     positions: [],
     characteristic: null,
+    depthPoint: null,
+    profileOverride: null,
   };
   v.groups.push(group);
   state.activeGroupId = group.id;
@@ -673,7 +763,28 @@ function renderGroups() {
     delBtn.addEventListener("click", (e) => {
       e.stopPropagation();
       v.groups = v.groups.filter((g) => g.id !== group.id);
-      if (state.activeGroupId === group.id) state.activeGroupId = null;
+      if (state.activeGroupId === group.id) {
+        state.activeGroupId = null;
+        state.spanPending = null;
+      }
+      // Clear any pending click-target state that pointed at the now-deleted group —
+      // otherwise the next canvas click silently no-ops through that mode's own
+      // `if (!group) return;` guard (findGroupById can no longer find it), leaving
+      // the app stuck swallowing every click with no error until the user happens to
+      // pick a different mode button.
+      if (state.depthPointTarget === group.id) {
+        state.depthPointTarget = null;
+        setMode("pan");
+      }
+      if (state.characteristicTarget === group.id) {
+        state.characteristicTarget = null;
+        state.characteristicPending = null;
+        setMode("pan");
+      }
+      if (state.depthAnchorTarget && state.depthAnchorTarget.groupId === group.id) {
+        state.depthAnchorTarget = null;
+        setMode("pan");
+      }
       refreshSidebar();
       refreshOverlay();
     });
@@ -778,42 +889,101 @@ function renderGroups() {
     results.className = "group-results";
     results.innerHTML = formatGroupResults(group, unit, pxPerMm, centerX, v.groups.length, corrections, v);
 
-    const charRow = document.createElement("div");
-    charRow.className = "characteristic-row";
-    const charBtn = document.createElement("button");
-    charBtn.className = "btn";
-    charBtn.textContent = group.characteristic ? `Update ${tool ? tool.dimension : "size"}` : `Set ${tool ? tool.dimension : "size"}`;
-    charBtn.addEventListener("click", (e) => {
-      e.stopPropagation();
-      state.characteristicTarget = group.id;
-      state.characteristicPending = null;
-      state.activeGroupId = group.id;
-      setMode("characteristic");
-      refreshSidebar();
-      if (tool) alert(`Click on the photo: 1) ${tool.prompts[0]}  2) ${tool.prompts[1]}`);
-    });
-    charRow.appendChild(charBtn);
+    // Diameter/length (dimension whose preferred axis is "depth") only shows its true
+    // size in profile, so — like lowest point — it's hard-restricted to the Side view,
+    // not just hinted. Width stays allowed from any view with just a soft hint: a flat
+    // tool's width is visible from several lateral angles (Front/Back/Top), so there's
+    // no single "only correct" photo the way there is for a round/depth tool.
+    const charAllowed = !tool || preferredAxisFor(tool.dimension) !== "depth" || v.role === "side";
+    let charRow = null;
     let mismatchHint = null;
-    if (state.characteristicTarget === group.id) {
-      const hint = document.createElement("span");
-      hint.className = "hint";
-      hint.style.margin = "0";
-      hint.textContent = state.characteristicPending ? "Click the second point..." : "Click the first point...";
-      charRow.appendChild(hint);
-    } else if (tool) {
-      const axisNow = axisCategoryForRole(v.role);
-      const preferred = preferredAxisFor(tool.dimension);
-      if (axisNow !== "both" && axisNow !== preferred) {
-        mismatchHint = document.createElement("p");
-        mismatchHint.className = "hint axis-mismatch-hint";
-        mismatchHint.textContent = `💡 ${tool.dimension} is usually clearer from a ${preferred === "depth" ? "Side" : "Front/Back/Top"} view — this is a ${ROLE_LABELS[v.role] || v.role} view.`;
+    if (charAllowed) {
+      charRow = document.createElement("div");
+      charRow.className = "characteristic-row";
+      const charBtn = document.createElement("button");
+      charBtn.className = "btn";
+      charBtn.textContent = group.characteristic ? `Update ${tool ? tool.dimension : "size"}` : `Set ${tool ? tool.dimension : "size"}`;
+      charBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        state.characteristicTarget = group.id;
+        state.characteristicPending = null;
+        state.activeGroupId = group.id;
+        setMode("characteristic");
+        refreshSidebar();
+        if (tool) alert(`Click on the photo: 1) ${tool.prompts[0]}  2) ${tool.prompts[1]}`);
+      });
+      charRow.appendChild(charBtn);
+      if (state.characteristicTarget === group.id) {
+        const hint = document.createElement("span");
+        hint.className = "hint";
+        hint.style.margin = "0";
+        hint.textContent = state.characteristicPending ? "Click the second point..." : "Click the first point...";
+        charRow.appendChild(hint);
+      } else if (tool) {
+        const axisNow = axisCategoryForRole(v.role);
+        const preferred = preferredAxisFor(tool.dimension);
+        if (axisNow !== "both" && axisNow !== preferred) {
+          mismatchHint = document.createElement("p");
+          mismatchHint.className = "hint axis-mismatch-hint";
+          mismatchHint.textContent = `💡 ${tool.dimension} is usually clearer from a ${preferred === "depth" ? "Side" : "Front/Back/Top"} view — this is a ${ROLE_LABELS[v.role] || v.role} view.`;
+        }
       }
+    } else if (group.characteristic) {
+      charRow = document.createElement("p");
+      charRow.className = "hint";
+      charRow.style.margin = "8px 0 0";
+      const dimensionLabel = `${tool.dimension[0].toUpperCase()}${tool.dimension.slice(1)}`;
+      // Name whichever view it was ACTUALLY measured in, not just "a Side view" — a
+      // session saved before this restriction existed could have it set from any
+      // view (Top/Front/Back), and hard-coding "Side" there would misinform the user
+      // about where the value actually came from.
+      const charView = state.session.views.find((sv) => sv.id === group.characteristic.viewId);
+      charRow.textContent = charView ? `${dimensionLabel} set (from "${charView.label}").` : `${dimensionLabel} set (from another view).`;
+    }
+
+    // Every tool gets a "lowest point" button — including a gauge/leveling wheel, since
+    // its own lowest point is exactly what other tools' depths get measured against
+    // (see toolCatalog.js `isDepthReference` and render.js buildToolDepthProfile). It's
+    // vertical position in a photo, only meaningful in profile — a Front/Back/Top photo
+    // doesn't show it at all — so unlike characteristic (diameter/length/width), this is
+    // a hard restriction to the active view being a Side view, not just a hint.
+    let depthRow = null;
+    if (v.role === "side") {
+      depthRow = document.createElement("div");
+      depthRow.className = "characteristic-row";
+      const depthBtn = document.createElement("button");
+      depthBtn.className = "btn";
+      depthBtn.textContent = group.depthPoint ? "Update lowest point" : "Set lowest point";
+      depthBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        state.depthPointTarget = group.id;
+        state.activeGroupId = group.id;
+        setMode("depthpoint");
+        refreshSidebar();
+      });
+      depthRow.appendChild(depthBtn);
+      if (state.depthPointTarget === group.id) {
+        const hint = document.createElement("span");
+        hint.className = "hint";
+        hint.style.margin = "0";
+        hint.textContent = tool && tool.isDepthReference
+          ? "Click where this wheel touches the ground..."
+          : "Click this tool's lowest point...";
+        depthRow.appendChild(hint);
+      }
+    } else if (group.depthPoint) {
+      depthRow = document.createElement("p");
+      depthRow.className = "hint";
+      depthRow.style.margin = "8px 0 0";
+      depthRow.textContent = "Lowest point set (from the Side view).";
     }
 
     card.append(header, chips);
     if (equalRow) card.appendChild(equalRow);
-    card.append(results, charRow);
+    card.appendChild(results);
+    if (charRow) card.appendChild(charRow);
     if (mismatchHint) card.appendChild(mismatchHint);
+    if (depthRow) card.appendChild(depthRow);
     container.appendChild(card);
   }
 }
@@ -988,29 +1158,64 @@ function renderDepthPanel() {
 
     // A tool's characteristic size is a single 2-click measurement, not tied to any one
     // view — set it from wherever it's actually visible (a disk's diameter from a Side
-    // view, even though the disk itself lives in a Back view).
+    // view, even though the disk itself lives in a Back view). Diameter/length are a
+    // hard Side-view-only restriction, same reasoning as lowest point below — only width
+    // (visible from several lateral angles) stays offered regardless of the active view.
+    // Requires a resolved `tool` (dimension/prompts come from the catalog); lowest point
+    // below does not, so it stays offered even for a group whose toolTypeId no longer
+    // resolves (e.g. stale/hand-edited data) — matching renderGroups' own version of
+    // this button, which is unconditional on `tool` for exactly that reason.
     if (tool) {
-      if (state.characteristicTarget === g.id) {
+      const charAllowed = preferredAxisFor(tool.dimension) !== "depth" || v.role === "side";
+      if (charAllowed) {
+        if (state.characteristicTarget === g.id) {
+          const status = document.createElement("span");
+          status.className = "hint";
+          status.style.margin = "0 0 0 auto";
+          status.textContent = state.characteristicPending
+            ? `Click: ${tool.prompts[1]}`
+            : `Click: ${tool.prompts[0]}`;
+          heading.appendChild(status);
+        } else {
+          const charBtn = document.createElement("button");
+          charBtn.className = "btn";
+          charBtn.style.marginLeft = "auto";
+          charBtn.textContent = g.characteristic ? `Update ${tool.dimension}` : `Set ${tool.dimension}`;
+          charBtn.addEventListener("click", () => {
+            state.characteristicTarget = g.id;
+            state.characteristicPending = null;
+            setMode("characteristic");
+            refreshOverlay();
+            refreshSidebar();
+          });
+          heading.appendChild(charBtn);
+        }
+      }
+    }
+
+    // Lowest point is a hard Side-view-only restriction (see renderGroups) — clicking
+    // it records the point in whichever view is currently active (`v`), so only offer
+    // it here when that active view is actually a Side view, regardless of which view
+    // this tool (`g`) natively lives in.
+    if (v.role === "side") {
+      if (state.depthPointTarget === g.id) {
         const status = document.createElement("span");
         status.className = "hint";
-        status.style.margin = "0 0 0 auto";
-        status.textContent = state.characteristicPending
-          ? `Click: ${tool.prompts[1]}`
-          : `Click: ${tool.prompts[0]}`;
+        status.style.margin = "0 0 0 6px";
+        status.textContent = "Click lowest point...";
         heading.appendChild(status);
       } else {
-        const charBtn = document.createElement("button");
-        charBtn.className = "btn";
-        charBtn.style.marginLeft = "auto";
-        charBtn.textContent = g.characteristic ? `Update ${tool.dimension}` : `Set ${tool.dimension}`;
-        charBtn.addEventListener("click", () => {
-          state.characteristicTarget = g.id;
-          state.characteristicPending = null;
-          setMode("characteristic");
+        const depthBtn = document.createElement("button");
+        depthBtn.className = "btn";
+        depthBtn.style.marginLeft = "6px";
+        depthBtn.textContent = g.depthPoint ? "Update lowest point" : "Set lowest point";
+        depthBtn.addEventListener("click", () => {
+          state.depthPointTarget = g.id;
+          setMode("depthpoint");
           refreshOverlay();
           refreshSidebar();
         });
-        heading.appendChild(charBtn);
+        heading.appendChild(depthBtn);
       }
     }
     list.appendChild(heading);
@@ -1210,6 +1415,37 @@ function renderScaleStatus() {
   }
 }
 
+// The angle readout is informational only — localAxesOf (measurements.js) projects
+// onto the centerline itself, so the correction works at any angle without needing to
+// know an "expected" one. It's here so the user can sanity-check their two clicks.
+function renderDirectionStatus() {
+  const v = activeView();
+  const el = document.getElementById("directionStatus");
+  const clearBtn = document.getElementById("clearDirectionBtn");
+  if (!v) {
+    el.textContent = "Not set";
+    el.style.color = "var(--text-dim)";
+    clearBtn.classList.add("hidden");
+    return;
+  }
+  if (v.centerline) {
+    const { hitch, rear } = v.centerline;
+    const angleDeg = (Math.atan2(rear.y - hitch.y, rear.x - hitch.x) * 180) / Math.PI;
+    const fromHorizontal = Math.abs(((Math.abs(angleDeg) + 90) % 180) - 90);
+    el.textContent = `Set — ${fromHorizontal.toFixed(1)}° from horizontal`;
+    el.style.color = "var(--text)";
+    clearBtn.classList.remove("hidden");
+  } else if (state.mode === "centerline" && state.centerlinePending) {
+    el.textContent = "Hitch placed — click the farthest-back point on the implement's centerline";
+    el.style.color = "var(--text-dim)";
+    clearBtn.classList.add("hidden");
+  } else {
+    el.textContent = "Not set";
+    el.style.color = "var(--text-dim)";
+    clearBtn.classList.add("hidden");
+  }
+}
+
 // ---------- overlay building ----------
 
 function refreshOverlay() {
@@ -1225,6 +1461,15 @@ function refreshOverlay() {
   if (s.p1) markers.push({ x: s.p1.x, y: s.p1.y, color: "#ffd93d", label: "1", ref: { kind: "scale", which: "p1" } });
   if (s.p2) markers.push({ x: s.p2.x, y: s.p2.y, color: "#ffd93d", label: "2", ref: { kind: "scale", which: "p2" } });
   if (s.p1 && s.p2) lines.push({ p1: s.p1, p2: s.p2, color: "#ffd93d", dashed: true });
+
+  if (v.centerline) {
+    const { hitch, rear } = v.centerline;
+    markers.push({ x: hitch.x, y: hitch.y, color: "#ff3fa4", label: "H", ref: { kind: "centerline", which: "hitch" } });
+    markers.push({ x: rear.x, y: rear.y, color: "#ff3fa4", label: "R", ref: { kind: "centerline", which: "rear" } });
+    lines.push({ p1: hitch, p2: rear, color: "#ff3fa4", dashed: true });
+  } else if (state.mode === "centerline" && state.centerlinePending) {
+    markers.push({ x: state.centerlinePending.x, y: state.centerlinePending.y, color: "#ff3fa4", label: "H" });
+  }
 
   for (const group of v.groups) {
     group.positions.forEach((pt, i) => {
@@ -1253,6 +1498,26 @@ function refreshOverlay() {
   if (state.characteristicTarget && state.characteristicPending) {
     const targetGroup = findGroupById(state.characteristicTarget);
     if (targetGroup) markers.push({ x: state.characteristicPending.x, y: state.characteristicPending.y, color: targetGroup.color, label: "A" });
+  }
+
+  // A depthPoint's marker only belongs on whichever view it was actually clicked in —
+  // same cross-view rule as characteristic markers above. If THIS view has since lost
+  // its scale (e.g. "Reset scale points"), buildToolDepthProfile silently excludes
+  // every depthPoint recorded here from the profile/export — flag that on the marker
+  // itself (danger color, "!" label) instead of leaving it looking perfectly normal
+  // and active while it's actually gone inert.
+  const scaleless = !v.scale.pixelsPerMm;
+  for (const ov of state.session.views) {
+    for (const group of ov.groups) {
+      if (group.depthPoint && group.depthPoint.viewId === v.id) {
+        markers.push({
+          x: group.depthPoint.x, y: group.depthPoint.y,
+          color: scaleless ? "#ff5c5c" : group.color,
+          label: scaleless ? "D!" : "D",
+          ref: { kind: "depthpoint", groupId: group.id },
+        });
+      }
+    }
   }
 
   for (const qm of v.quickMeasurements) {
@@ -1286,6 +1551,7 @@ function refreshOverlay() {
 
 function refreshSidebar() {
   renderScaleStatus();
+  renderDirectionStatus();
   renderScaleRefOptions();
   renderGroups();
   renderDepthPanel();
@@ -1356,31 +1622,45 @@ document.getElementById("exportPngBtn").addEventListener("click", () => {
 // ---------- render (3D scatter + flat schematic) ----------
 
 const renderModal = document.getElementById("renderModal");
-let currentRenderSvg = null;
+let currentSchematicSvg = null;
+let currentProfileSvg = null;
 let currentRenderTab = "scatter";
+let currentProfileResult = null;
 let scatter3d = null;
+// Per-tool "Show in diagram" toggles — a view-only convenience for isolating one or a
+// few tools at a time when several overlap and are hard to tell apart, so it's kept as
+// session-only UI state (group ids), not saved with the profile.
+const profileHiddenLaneIds = new Set();
 
 function setRenderTab(tab) {
   currentRenderTab = tab;
   document.querySelectorAll(".render-tab-btn").forEach((b) => b.classList.toggle("active", b.dataset.renderTab === tab));
   document.getElementById("scatterTab").classList.toggle("hidden", tab !== "scatter");
   document.getElementById("schematicTab").classList.toggle("hidden", tab !== "schematic");
-  document.getElementById("downloadRenderSvgBtn").style.display = tab === "schematic" ? "" : "none";
+  document.getElementById("profileTab").classList.toggle("hidden", tab !== "profile");
+  // SVG download only makes sense for the two vector tabs; PNG works for all three
+  // (the scatter tab's own handler below rasterizes the WebGL/canvas view instead).
+  document.getElementById("downloadRenderSvgBtn").style.display = tab === "schematic" || tab === "profile" ? "" : "none";
+  document.getElementById("downloadRenderPngBtn").style.display = "";
   if (tab === "scatter" && scatter3d) scatter3d.render();
 }
 
 document.querySelectorAll(".render-tab-btn").forEach((b) => b.addEventListener("click", () => setRenderTab(b.dataset.renderTab)));
 
-document.getElementById("renderBtn").addEventListener("click", () => {
+// Rebuilds every render tab from current measurements. `openModal` is only true for the
+// initial "Render Implement" click — table edits in the Profile tab (tillage type/soil
+// inversion/full width overrides) call this again to refresh without resetting which
+// tab is showing or re-opening the modal.
+function runRender({ openModal = false } = {}) {
   const schematicResult = buildImplementRender(state.session);
   const holder = document.getElementById("renderSvgHolder");
   const unplacedEl = document.getElementById("renderUnplaced");
   holder.innerHTML = "";
   unplacedEl.innerHTML = "";
-  currentRenderSvg = null;
+  currentSchematicSvg = null;
 
   if (schematicResult) {
-    currentRenderSvg = schematicResult.svg;
+    currentSchematicSvg = schematicResult.svg;
     holder.appendChild(schematicResult.svg);
     if (schematicResult.unplaced.length) {
       unplacedEl.innerHTML =
@@ -1394,13 +1674,16 @@ document.getElementById("renderBtn").addEventListener("click", () => {
   }
 
   const scatterData = buildScatterPoints(state.session);
-  if (!scatterData.points.length && !schematicResult) {
-    alert("Add at least one tool with instances placed (in any view) before rendering.");
+  const profileResult = buildToolDepthProfile(state.session, state.session.profileUnit || state.session.displayUnit);
+  if (openModal && !scatterData.points.length && !schematicResult && !profileResult.lanes.length) {
+    alert("Add at least one tool with instances placed, or a \"lowest point\" set (in any view), before rendering.");
     return;
   }
 
-  renderModal.classList.remove("hidden");
-  setRenderTab("scatter");
+  if (openModal) {
+    renderModal.classList.remove("hidden");
+    setRenderTab("scatter");
+  }
 
   if (!scatter3d) scatter3d = new Scatter3D(document.getElementById("scatterCanvas"));
   scatter3d.setPoints(scatterData.points);
@@ -1419,6 +1702,269 @@ document.getElementById("renderBtn").addEventListener("click", () => {
   } else {
     warningEl.classList.add("hidden");
   }
+
+  const unscaledLowest = findUnscaledLowestPointViews(state.session);
+  const profileWarningEl = document.getElementById("profileUnscaledHint");
+  if (unscaledLowest.length) {
+    profileWarningEl.textContent = `⚠ "${unscaledLowest.map((v) => v.label).join('", "')}" has a "lowest point" set but no scale of its own — that view is being skipped here entirely until its scale is set.`;
+    profileWarningEl.classList.remove("hidden");
+  } else {
+    profileWarningEl.classList.add("hidden");
+  }
+
+  const crossViewHintEl = document.getElementById("profileDominantCrossViewHint");
+  if (profileResult.dominantSpansUnreferencedViews) {
+    crossViewHintEl.textContent = '⚠ No Side view has a Gauge/Leveling Wheel measured, and the deepest tool was picked by comparing depths across different Side views — each was only measured relative to its own shallowest tool, so this comparison isn\'t on a real shared scale. Set a gauge wheel in at least one view, or double-check the dominant tool by eye.';
+    crossViewHintEl.classList.remove("hidden");
+  } else {
+    crossViewHintEl.classList.add("hidden");
+  }
+
+  currentProfileResult = profileResult;
+  renderProfileTab(currentProfileResult);
+}
+
+document.getElementById("renderBtn").addEventListener("click", () => runRender({ openModal: true }));
+
+// `skipInputValues` is set by the per-row "Show" checkbox's lightweight re-render —
+// clicking a checkbox necessarily moves focus onto it first, so an activeElement
+// check can't tell "user mid-edit" from "user clicked elsewhere" at the point this
+// runs; skipping the two free-text fields entirely on that specific path is what
+// actually prevents wiping an in-progress, not-yet-Applied edit (everything else —
+// labels, notes, the diagram, the table — still refreshes normally).
+function renderProfileTab(profileResult, { skipInputValues = false } = {}) {
+  const holder = document.getElementById("profileTableHolder");
+  const crossSectionHolder = document.getElementById("profileCrossSectionHolder");
+  const noData = document.getElementById("profileNoDataHint");
+  const depthRow = document.getElementById("implementDepthRow");
+  const bedWidthRow = document.getElementById("bedWidthRow");
+  holder.innerHTML = "";
+  crossSectionHolder.innerHTML = "";
+  currentProfileSvg = null;
+  document.getElementById("profileUnitSelect").value = profileResult ? profileResult.unit : state.session.displayUnit;
+  if (!profileResult || !profileResult.lanes.length || !profileResult.dominant) {
+    noData.classList.remove("hidden");
+    depthRow.classList.add("hidden");
+    bedWidthRow.classList.add("hidden");
+    return;
+  }
+  noData.classList.add("hidden");
+  const unit = profileResult.unit;
+
+  depthRow.classList.remove("hidden");
+  const implementDepthInput = document.getElementById("implementDepthInput");
+  if (!skipInputValues) implementDepthInput.value = profileResult.dominant.depth;
+  document.getElementById("implementDepthUnit").textContent = unit;
+  document.getElementById("resetImplementDepthBtn").classList.toggle("hidden", !profileResult.depthOverrideApplied);
+  const measuredNote = document.getElementById("implementDepthMeasuredNote");
+  measuredNote.textContent = profileResult.depthOverrideApplied
+    ? `measured from photos: ${profileResult.measuredDominantDepth} ${unit}`
+    : "";
+
+  bedWidthRow.classList.remove("hidden");
+  const bedWidthOverride = state.session.profileBedWidthOverride;
+  // Must match buildTillageCrossSectionSvg's own acceptance check (render.js) exactly
+  // — otherwise a value the UI treats as "active" (hiding the measured note, showing
+  // Reset) can be one the renderer silently rejects and falls back from, leaving the
+  // field and the actual diagram/export disagreeing with no indication why.
+  const overrideAsNumber = Number(bedWidthOverride);
+  const hasBedWidthOverride = bedWidthOverride != null && bedWidthOverride !== "" && Number.isFinite(overrideAsNumber) && overrideAsNumber > 0;
+  const bedWidthInput = document.getElementById("bedWidthInput");
+  document.getElementById("bedWidthUnit").textContent = unit;
+  document.getElementById("resetBedWidthBtn").classList.toggle("hidden", !hasBedWidthOverride);
+  // Always reflect an active override in the field itself — mirrors how the Depth
+  // field above always shows its effective value — set here (not just in the
+  // `!hasBedWidthOverride` branch below) so it's never left blank, which previously
+  // made clicking Apply without noticing silently wipe a saved override back to null.
+  if (hasBedWidthOverride && !skipInputValues) bedWidthInput.value = round(overrideAsNumber);
+
+  const crossSection = buildTillageCrossSectionSvg(profileResult, { bedWidthOverride, hiddenLaneIds: profileHiddenLaneIds });
+  if (crossSection) {
+    currentProfileSvg = crossSection.svg;
+    crossSectionHolder.appendChild(crossSection.svg);
+    if (!hasBedWidthOverride && !skipInputValues) bedWidthInput.value = round(crossSection.measuredBedWidth);
+    document.getElementById("bedWidthMeasuredNote").textContent = hasBedWidthOverride
+      ? `measured from photos: ${round(crossSection.measuredBedWidth)} ${unit}`
+      : "";
+  } else {
+    crossSectionHolder.innerHTML = '<p class="hint">Every tool is hidden — check at least one "Show" box below to see the diagram.</p>';
+    document.getElementById("bedWidthMeasuredNote").textContent = "";
+  }
+
+  const table = document.createElement("table");
+  table.className = "profile-table";
+  const thead = document.createElement("thead");
+  thead.innerHTML =
+    "<tr><th>Show</th><th>Tool</th><th>View</th><th>Depth</th><th>Width / Spacing</th><th>Full width</th><th>Tillage type</th><th>Soil inversion</th></tr>";
+  table.appendChild(thead);
+  const tbody = document.createElement("tbody");
+
+  const sorted = [...profileResult.lanes].sort((a, b) => b.depth - a.depth);
+  for (const lane of sorted) {
+    const tr = document.createElement("tr");
+    if (lane === profileResult.dominant) tr.classList.add("dominant-row");
+
+    const showTd = document.createElement("td");
+    const showCheckbox = document.createElement("input");
+    showCheckbox.type = "checkbox";
+    showCheckbox.checked = !profileHiddenLaneIds.has(lane.group.id);
+    showCheckbox.title = "Show or hide this tool in the diagram above (doesn't affect the table or export)";
+    showCheckbox.addEventListener("change", (e) => {
+      if (e.target.checked) profileHiddenLaneIds.delete(lane.group.id);
+      else profileHiddenLaneIds.add(lane.group.id);
+      renderProfileTab(currentProfileResult, { skipInputValues: true });
+    });
+    showTd.appendChild(showCheckbox);
+    tr.appendChild(showTd);
+
+    const toolTd = document.createElement("td");
+    toolTd.innerHTML = `<span class="tool-swatch" style="background:${lane.group.color}"></span>${lane.group.name}`;
+    tr.appendChild(toolTd);
+
+    const viewTd = document.createElement("td");
+    viewTd.textContent = lane.view.label;
+    tr.appendChild(viewTd);
+
+    // Depth is NOT editable per tool here — the relative depth between tools is real
+    // measured geometry (that's the entire point of setting each one's lowest point);
+    // only the implement's overall depth (below) is meant to be adjusted, and it shifts
+    // every lane together so this relative structure never changes.
+    const depthTd = document.createElement("td");
+    depthTd.innerHTML = `${lane.depth} ${unit}` + (lane.hasAbsoluteReference ? "" : '<span class="relative-note">relative — no gauge wheel in this view</span>');
+    tr.appendChild(depthTd);
+
+    const widthTd = document.createElement("td");
+    const w = lane.widthStats;
+    if (w && lane.tool.instanceMode === "span" && w.totalWidth != null) {
+      widthTd.textContent = `${w.totalWidth} ${unit} total`;
+    } else if (w && w.width) {
+      widthTd.textContent = `${w.width} ${unit}${w.avgGap != null ? `, ${w.avgGap} ${unit} spacing` : ""}`;
+    } else {
+      widthTd.textContent = "—";
+    }
+    tr.appendChild(widthTd);
+
+    const fullWidthTd = document.createElement("td");
+    const fwCheckbox = document.createElement("input");
+    fwCheckbox.type = "checkbox";
+    fwCheckbox.checked = lane.fullWidth;
+    fwCheckbox.addEventListener("change", (e) => {
+      lane.group.profileOverride = lane.group.profileOverride || {};
+      lane.group.profileOverride.fullWidth = e.target.checked;
+      runRender();
+    });
+    fullWidthTd.appendChild(fwCheckbox);
+    tr.appendChild(fullWidthTd);
+
+    const tillageTd = document.createElement("td");
+    const select = document.createElement("select");
+    for (const t of TILLAGE_TYPES) {
+      const opt = document.createElement("option");
+      opt.value = t;
+      opt.textContent = t.replace(/_/g, " ");
+      select.appendChild(opt);
+    }
+    select.value = lane.tillageType || TILLAGE_TYPES[0];
+    select.addEventListener("change", (e) => {
+      lane.group.profileOverride = lane.group.profileOverride || {};
+      lane.group.profileOverride.tillageType = e.target.value;
+      runRender();
+    });
+    tillageTd.appendChild(select);
+    tr.appendChild(tillageTd);
+
+    const inversionTd = document.createElement("td");
+    const invCheckbox = document.createElement("input");
+    invCheckbox.type = "checkbox";
+    invCheckbox.checked = lane.soilInversion;
+    invCheckbox.addEventListener("change", (e) => {
+      lane.group.profileOverride = lane.group.profileOverride || {};
+      lane.group.profileOverride.soilInversion = e.target.checked;
+      runRender();
+    });
+    inversionTd.appendChild(invCheckbox);
+    tr.appendChild(inversionTd);
+
+    tbody.appendChild(tr);
+  }
+  table.appendChild(tbody);
+  holder.appendChild(table);
+}
+
+// Every other measured tool + its own depth, as a readable summary — the OFE tool's
+// schema has no room for per-component granularity, so it goes in the one free-text
+// field instead of being lost entirely.
+function buildTillageNotes(profileResult) {
+  const unit = profileResult.unit;
+  const lines = [...profileResult.lanes]
+    .sort((a, b) => b.depth - a.depth)
+    .map((l) => {
+      const bits = [`${l.group.name} (${l.view.label}): depth ${l.depth} ${unit}`];
+      if (l === profileResult.dominant) bits.push("dominant/exported");
+      if (!l.hasAbsoluteReference) bits.push("relative depth, no gauge wheel");
+      return bits.join(" — ");
+    });
+  return `Generated by Machinery Image Processor from measured tool depths:\n${lines.join("\n")}`;
+}
+
+function buildTillageInputFromLane(lane, profileResult) {
+  const unit = profileResult.unit;
+  const isSpan = lane.tool.instanceMode === "span";
+  const w = lane.widthStats;
+  return {
+    tillageType: lane.tillageType,
+    fullWidth: lane.fullWidth,
+    depth: { value: lane.depth, unit },
+    stripWidth: isSpan && w && w.totalWidth != null ? { value: w.totalWidth, unit } : null,
+    offsetFromLeft: null,
+    patternSpacing: !isSpan && w && w.avgGap != null ? { value: w.avgGap, unit } : null,
+    soilInversion: lane.soilInversion,
+    daysBeforeMainCrop: 0,
+    notes: buildTillageNotes(profileResult),
+  };
+}
+
+document.getElementById("applyImplementDepthBtn").addEventListener("click", () => {
+  const raw = document.getElementById("implementDepthInput").value;
+  state.session.profileDepthOverride = raw === "" ? null : raw;
+  runRender();
+});
+document.getElementById("resetImplementDepthBtn").addEventListener("click", () => {
+  state.session.profileDepthOverride = null;
+  runRender();
+});
+
+// Changing the Profile tab's own unit re-derives depth/width/bed-width from the
+// underlying pixel measurements in the new unit — it does NOT convert whatever
+// numbers are currently sitting in the override fields, since those are independent,
+// user-stated values (an overall depth typed in cm doesn't become that same number in
+// inches) — so switching units clears both overrides rather than silently
+// misinterpreting them.
+document.getElementById("profileUnitSelect").addEventListener("change", (e) => {
+  state.session.profileUnit = e.target.value;
+  state.session.profileDepthOverride = null;
+  state.session.profileBedWidthOverride = null;
+  runRender();
+});
+
+document.getElementById("applyBedWidthBtn").addEventListener("click", () => {
+  const raw = document.getElementById("bedWidthInput").value;
+  state.session.profileBedWidthOverride = raw === "" ? null : raw;
+  runRender();
+});
+document.getElementById("resetBedWidthBtn").addEventListener("click", () => {
+  state.session.profileBedWidthOverride = null;
+  runRender();
+});
+
+document.getElementById("exportTillageJsonBtn").addEventListener("click", () => {
+  if (!currentProfileResult || !currentProfileResult.dominant) {
+    alert('No tool has a "lowest point" set yet — set at least one (ideally from a Side view) before exporting.');
+    return;
+  }
+  const tillageInput = buildTillageInputFromLane(currentProfileResult.dominant, currentProfileResult);
+  const blob = new Blob([JSON.stringify([tillageInput], null, 2)], { type: "application/json" });
+  download(blob, `${state.session.name || "tool-profile"}-tillage-pass.json`);
 });
 
 document.getElementById("closeRenderBtn").addEventListener("click", () => renderModal.classList.add("hidden"));
@@ -1426,8 +1972,14 @@ document.getElementById("scatterRotateLeftBtn").addEventListener("click", () => 
 document.getElementById("scatterRotateRightBtn").addEventListener("click", () => scatter3d && scatter3d.rotateBy(0.3));
 document.getElementById("scatterResetBtn").addEventListener("click", () => scatter3d && scatter3d.resetView());
 
+function activeRenderSvg() {
+  return currentRenderTab === "profile" ? currentProfileSvg : currentSchematicSvg;
+}
+
 document.getElementById("downloadRenderSvgBtn").addEventListener("click", () => {
-  if (currentRenderSvg) downloadSvg(currentRenderSvg, `${state.session.name || "implement"}.svg`);
+  const svg = activeRenderSvg();
+  const suffix = currentRenderTab === "profile" ? "-cross-section" : "";
+  if (svg) downloadSvg(svg, `${state.session.name || "implement"}${suffix}.svg`);
 });
 document.getElementById("downloadRenderPngBtn").addEventListener("click", () => {
   if (currentRenderTab === "scatter") {
@@ -1440,8 +1992,10 @@ document.getElementById("downloadRenderPngBtn").addEventListener("click", () => 
       a.click();
       a.remove();
     });
-  } else if (currentRenderSvg) {
-    downloadSvgAsPng(currentRenderSvg, `${state.session.name || "implement"}.png`);
+  } else {
+    const svg = activeRenderSvg();
+    const suffix = currentRenderTab === "profile" ? "-cross-section" : "";
+    if (svg) downloadSvgAsPng(svg, `${state.session.name || "implement"}${suffix}.png`);
   }
 });
 
@@ -1491,11 +2045,19 @@ async function renderHistory() {
 }
 
 async function loadSessionIntoApp(session) {
+  if (session.profileDepthOverride === undefined) session.profileDepthOverride = null;
+  if (session.profileUnit === undefined) session.profileUnit = null;
+  if (session.profileBedWidthOverride === undefined) session.profileBedWidthOverride = null;
   for (const v of session.views) {
     if (!v.role) v.role = "other";
     if (!v.depthAnchors) v.depthAnchors = [];
     if (!v.equalSpacingGroups) v.equalSpacingGroups = {};
     if (v.role === "top" && v.topLateralAxis !== "x" && v.topLateralAxis !== "y") v.topLateralAxis = "y";
+    if (v.centerline === undefined) v.centerline = null;
+    for (const g of v.groups) {
+      if (g.depthPoint === undefined) g.depthPoint = null;
+      if (g.profileOverride === undefined) g.profileOverride = null;
+    }
   }
   state.session = session;
   resetInteractionState();

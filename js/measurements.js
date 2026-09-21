@@ -28,7 +28,7 @@ export function pxToMm(px, pixelsPerMm) {
   return px / pixelsPerMm;
 }
 
-function round(value, decimals = 2) {
+export function round(value, decimals = 2) {
   return Math.round(value * 10 ** decimals) / 10 ** decimals;
 }
 
@@ -127,25 +127,84 @@ export function characteristicResult(session, group, displayUnit) {
   return computePairDistance(group.characteristic.p1, group.characteristic.p2, view.scale.pixelsPerMm, displayUnit);
 }
 
+// Projects a point onto a view's own local axes instead of trusting raw image x/y.
+// With a `centerline` set (two points: hitch + the implement's farthest-back point
+// along its own centerline, placed to mark its true fore-aft direction in this photo —
+// see the "Set Direction" mode in js/app.js) this corrects for the camera/implement
+// not being held perfectly level: `along` is the component along hitch→rear, `perp` is
+// perpendicular to it, via ordinary 2D vector projection, so it's correct for ANY tilt
+// angle, not just the axis-aligned case. A Side view's own primary axis is front-to-
+// back (`along`, running down the centerline); every other role's primary axis is
+// left-right (`perp`, across the implement). Without a centerline, falls back to the
+// exact previous behavior — raw x, or swapped x/y for a "top" view framed with its
+// lateral axis running down the photo (`topLateralAxis === "y"`) — so any profile
+// saved before this feature existed renders identically.
+function localAxesOf(view, pt) {
+  if (view && view.centerline) {
+    const { hitch, rear } = view.centerline;
+    const dx = rear.x - hitch.x;
+    const dy = rear.y - hitch.y;
+    const len = Math.hypot(dx, dy) || 1;
+    const ux = dx / len, uy = dy / len; // unit vector along hitch->rear
+    // The 90°-rotated perpendicular's sign depends entirely on which way hitch->rear
+    // happens to point in THIS photo — i.e. which side of the implement the camera
+    // was standing on, an arbitrary framing choice, not anything physical. Left
+    // unanchored, the identical real implement photographed from the opposite side
+    // (an equally normal shot, hitch still clicked first either time) flips every
+    // depth sign — this broke buildToolDepthProfile's dominant-tool selection. For a
+    // Side view, anchor to gravity instead: "deeper into the soil" is always further
+    // DOWN the image (+y) regardless of which side the photo was shot from, so flip
+    // the perpendicular to always point downward — this is a real fix, not just a
+    // convention choice. Every other role (lateral position) has no equivalent
+    // physical anchor for left/right — a mirrored photo genuinely can't be corrected
+    // from 2 points alone, same as with plain pixel x before centerlines existed — so
+    // this just picks image +x (rightward) as a fixed, arbitrary-but-consistent
+    // convention, purely for tidiness (e.g. "offset from center" sign in the UI).
+    let vx = -uy, vy = ux; // perpendicular unit vector, sign TBD
+    const anchor = view.role === "side" ? vy : vx;
+    if (anchor < 0) {
+      vx = -vx;
+      vy = -vy;
+    }
+    const px = pt.x - hitch.x, py = pt.y - hitch.y;
+    const along = px * ux + py * uy;
+    const perp = px * vx + py * vy;
+    return view.role === "side" ? { primary: along, secondary: perp } : { primary: perp, secondary: along };
+  }
+  const swapped = view && view.role === "top" && view.topLateralAxis === "y";
+  return swapped ? { primary: pt.y, secondary: pt.x } : { primary: pt.x, secondary: pt.y };
+}
+
 // A "top" photo can be framed either way — implement running across the frame or down
-// it — so unlike front/back/side (where the meaningful axis is always the photo's own
-// x), a top view has to say which pixel axis its lateral (left-right) measurements live
-// on. Every other role always reads x.
+// it — so unlike front/back/side (where the meaningful axis is normally the photo's
+// own x), a top view has to say which pixel axis its lateral (left-right)
+// measurements live on — via `topLateralAxis`, or precisely via a `centerline`
+// (see localAxesOf above). Every other role's primary axis is x (or, with a
+// centerline, whatever's perpendicular to the implement's true fore-aft direction).
 export function lateralCoordOf(view, pt) {
-  if (view && view.role === "top" && view.topLateralAxis === "y") return pt.y;
-  return pt.x;
+  return localAxesOf(view, pt).primary;
+}
+
+// For a Side view with a centerline set, the axis perpendicular to the implement's
+// fore-aft direction is vertical (soil depth) — this is what corrects the "lowest
+// point" depth measurement (js/render.js's buildToolDepthProfile) for a tilted photo.
+// Without a centerline, falls back to raw pt.y, matching prior behavior.
+export function verticalCoordOf(view, pt) {
+  if (view && view.centerline && view.role === "side") return localAxesOf(view, pt).secondary;
+  return pt.y;
 }
 
 // computeSeriesResult/computeSpanResult always order and label along a point's x — fine
-// for front/back/side, where the meaningful axis is always the photo's own x, but wrong
-// for a "top" view framed with its lateral axis running down the photo (topLateralAxis
-// "y"). Rather than teach those functions about roles, swap x/y going in: pixelDistance
-// is symmetric under the swap, so counts/gaps/widths come out correct either way.
+// when a view's primary axis IS the photo's own x, but wrong otherwise (a "top" view
+// framed with its lateral axis running down the photo, or any view with a tilted
+// centerline). Rather than teach those functions about axes, remap each point to
+// {x: primary, y: secondary} going in: pixelDistance is rotation-invariant, so gap/
+// width magnitudes come out correct either way — this only fixes the sort order.
 export function seriesPoints(view, positions) {
-  if (view && view.role === "top" && view.topLateralAxis === "y") {
-    return positions.map((p) => ({ ...p, x: p.y, y: p.x }));
-  }
-  return positions;
+  return positions.map((p) => {
+    const { primary, secondary } = localAxesOf(view, p);
+    return { ...p, x: primary, y: secondary };
+  });
 }
 
 // A group's own lateral anchor in pixel space: the midpoint of its repeating instances,
